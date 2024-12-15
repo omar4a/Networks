@@ -1,9 +1,12 @@
-from scapy.all import ARP, Ether, srp, sr1, ICMP, IP, conf, sniff, DHCP, BOOTP
+from scapy.all import ARP, Ether, srp, sr1, ICMP, IP, conf, sniff, DHCP, BOOTP, sendp, UDP
 import psutil
 import socket
 import ipaddress
 import concurrent.futures
 import csv
+
+allocated_ips = []
+available_ips = []
 
 def get_network_info():
     interfaces = psutil.net_if_addrs()
@@ -27,6 +30,9 @@ def get_network_info():
 
     network = ipaddress.IPv4Network(f"{ip_address}/{netmask}", strict=False)
     return network, ip_address, netmask, network_interface
+
+# GLOBAL VARIABLES
+network, ip_address, netmask, network_interface = get_network_info()
 
 def arp_scan(ip_range, iface):
     arp = ARP(pdst=ip_range)
@@ -68,7 +74,33 @@ def save_to_csv(allocated_ips, filename='DHCP.csv'):
         for ip_info in allocated_ips:
             writer.writerow({'IP Address': ip_info['ip'], 'MAC Address': ip_info['mac']})
 
+def calculate_available_ips(network):
+
+    global allocated_ips
+
+    allocated_ip_addresses = set(device['ip'] for device in allocated_ips)
+    
+    all_ips = set(ip for ip in network.hosts())
+    
+    available_ips = all_ips - allocated_ip_addresses
+    
+    return list(available_ips)
+
+def format_mac_address(mac_bytes):
+    return ':'.join(f'{b:02x}' for b in mac_bytes[:6])
+
+def get_local_ip():
+    hostname = socket.gethostname()
+    local_ip = socket.gethostbyname(hostname)
+    return local_ip
+
+
+
 def initiate():
+
+    global allocated_ips
+    global available_ips
+
     network, ip_address, netmask, network_interface = get_network_info()
     ip_range = f"{network.network_address}/{network.prefixlen}"
 
@@ -77,18 +109,49 @@ def initiate():
     arp_devices = arp_scan(ip_range, network_interface)
     icmp_devices = icmp_scan(ip_range)
 
-    allocated_ips = {device['ip']: device for device in arp_devices}
-    for device in icmp_devices:
-        if device['ip'] not in allocated_ips:
-            allocated_ips[device['ip']] = device
+    allocated_ips.extend(arp_devices)
+    allocated_ips.extend(device for device in icmp_devices if device['ip'] not in [d['ip'] for d in allocated_ips])
 
-    allocated_ips_list = list(allocated_ips.values())
-
-    save_to_csv(allocated_ips_list)
-
+    save_to_csv(allocated_ips)
 
 def handle_discover(packet):
-    print(f"DHCP Discover")
+    global allocated_ips
+    global available_ips
+    global network_interface
+    
+    requested_ip = None
+    for option in packet[DHCP].options:
+        if option[0] == 'requested_addr':
+            requested_ip = option[1]
+            break
+    
+    if requested_ip and (requested_ip not in allocated_ips):
+        offer_ip = requested_ip
+    else:
+        if available_ips:
+            offer_ip = available_ips.pop(0)
+        else:
+            print("No available IP addresses to offer")
+            return
+
+    server_ip = get_local_ip()
+    client_mac = packet[BOOTP].chaddr
+    transaction_id = packet[BOOTP].xid
+
+    offer_packet = (Ether(dst=packet[Ether].src) /
+                    IP(src=server_ip, dst="255.255.255.255") /
+                    UDP(sport=67, dport=68) /
+                    BOOTP(op=2, yiaddr=offer_ip, siaddr=server_ip, chaddr=client_mac[:6], xid=transaction_id) /
+                    DHCP(options=[('message-type', 'offer'), ('server_id', server_ip), ('lease_time', 600), ('subnet_mask', '255.255.255.0'), ('end')]))
+    
+    sendp(offer_packet, iface=network_interface)
+    
+    mac_address = format_mac_address(packet[BOOTP].chaddr)
+    print(f"Offered IP address {offer_ip} to {mac_address}")
+
+def format_mac_address(mac_bytes):
+    return ':'.join(f'{b:02x}' for b in mac_bytes[:6])
+
 
 def handle_offer(packet):
     print(f"DHCP Offer")
@@ -136,8 +199,6 @@ def sniff_dhcp_packets(interface):
 
 
 if __name__ == "__main__":
-
-    network, ip_address, netmask, network_interface = get_network_info()
 
     initiate()
 
