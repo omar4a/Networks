@@ -4,6 +4,7 @@ import socket
 import ipaddress
 import concurrent.futures
 import csv
+import os
 
 allocated_ips = []
 available_ips = []
@@ -31,8 +32,34 @@ def get_network_info():
     network = ipaddress.IPv4Network(f"{ip_address}/{netmask}", strict=False)
     return network, ip_address, netmask, network_interface
 
+def get_default_gateway():
+    gws = psutil.net_if_stats()
+    for interface, stats in gws.items():
+        if stats.isup:
+            addrs = psutil.net_if_addrs()[interface]
+            for addr in addrs:
+                if addr.family == socket.AF_INET:
+                    for gw in psutil.net_if_stats():
+                        if gw == interface and psutil.net_if_stats()[gw].isup:
+                            try:
+                                routes = psutil.net_if_addrs()[interface]
+                                for route in routes:
+                                    if route.family == socket.AF_INET and not route.address.startswith("169.254"):
+                                        command = "route print"
+                                        process = os.popen(command)
+                                        output = process.read()
+                                        process.close()
+                                        for line in output.splitlines():
+                                            if "0.0.0.0" in line:
+                                                default_gateway = line.split()[2]
+                                                return default_gateway
+                            except KeyError:
+                                continue
+    raise RuntimeError("Default gateway not found")
+
 # GLOBAL VARIABLES
 network, ip_address, netmask, network_interface = get_network_info()
+default_gateway = get_default_gateway()
 
 def arp_scan(ip_range, iface):
     arp = ARP(pdst=ip_range)
@@ -67,24 +94,23 @@ def icmp_scan(ip_range, retries=1, timeout=1):
 
 def save_to_csv(allocated_ips, filename='DHCP.csv'):
     with open(filename, 'w', newline='') as csvfile:
-        fieldnames = ['IP Address', 'MAC Address']
+        fieldnames = ['IP Address']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
         writer.writeheader()
-        for ip_info in allocated_ips:
-            writer.writerow({'IP Address': ip_info['ip'], 'MAC Address': ip_info['mac']})
+        for ip in allocated_ips:
+            writer.writerow({'IP Address': ip})
 
 def calculate_available_ips(network):
-
     global allocated_ips
 
-    allocated_ip_addresses = set(device['ip'] for device in allocated_ips)
+    allocated_ip_addresses = set(allocated_ips)
     
-    all_ips = set(ip for ip in network.hosts())
+    all_ips = set(str(ip) for ip in network.hosts())
     
     available_ips = all_ips - allocated_ip_addresses
     
-    return list(available_ips)
+    return sorted(list(available_ips))
 
 def format_mac_address(mac_bytes):
     return ':'.join(f'{b:02x}' for b in mac_bytes[:6])
@@ -95,13 +121,10 @@ def get_local_ip():
     return local_ip
 
 
-
 def initiate():
 
-    global allocated_ips
-    global available_ips
+    global allocated_ips, available_ips, network, ip_address, netmask, network_interface
 
-    network, ip_address, netmask, network_interface = get_network_info()
     ip_range = f"{network.network_address}/{network.prefixlen}"
 
     print(f"Scanning network: {ip_range} on interface {network_interface}")
@@ -109,15 +132,16 @@ def initiate():
     arp_devices = arp_scan(ip_range, network_interface)
     icmp_devices = icmp_scan(ip_range)
 
-    allocated_ips.extend(arp_devices)
-    allocated_ips.extend(device for device in icmp_devices if device['ip'] not in [d['ip'] for d in allocated_ips])
+
+    allocated_ips.extend(device['ip'] for device in arp_devices)
+    allocated_ips.extend(device['ip'] for device in icmp_devices if device['ip'] not in allocated_ips)
+
+    available_ips = calculate_available_ips(network)
 
     save_to_csv(allocated_ips)
 
 def handle_discover(packet):
-    global allocated_ips
-    global available_ips
-    global network_interface
+    global allocated_ips, available_ips, network_interface
     
     requested_ip = None
     for option in packet[DHCP].options:
@@ -157,7 +181,57 @@ def handle_offer(packet):
     print(f"DHCP Offer")
 
 def handle_request(packet):
-    print(f"DHCP Request")
+    global allocated_ips, available_ips, network_interface, default_gateway
+
+    requested_ip = None
+    for option in packet[DHCP].options:
+        if option[0] == 'requested_addr':
+            requested_ip = option[1]
+            break
+
+    if requested_ip is None:
+        print("No requested IP found in DHCP options")
+        return
+
+    client_mac = packet[BOOTP].chaddr
+    transaction_id = packet[BOOTP].xid
+
+    if requested_ip and (requested_ip not in allocated_ips):
+        ack_ip = requested_ip
+    else:
+        print("Requested IP not found or already allocated")
+        return
+
+    server_ip = get_local_ip()
+
+    try:
+        router_ip = default_gateway
+        dns_servers = ["62.240.110.198", "62.240.110.197"]  # Manual Configuration
+    except RuntimeError as e:
+        print(str(e))
+        return
+
+    ack_packet = (Ether(dst=packet[Ether].src) /
+                  IP(src=server_ip, dst="255.255.255.255") /
+                  UDP(sport=67, dport=68) /
+                  BOOTP(op=2, yiaddr=ack_ip, siaddr=server_ip, chaddr=client_mac[:6], xid=transaction_id) /
+                  DHCP(options=[('message-type', 'ack'),
+                                ('server_id', server_ip),
+                                ('lease_time', 600),
+                                ('subnet_mask', '255.255.255.0'),
+                                ('router', router_ip),
+                                ('name_server', dns_servers[0]),
+                                ('name_server', dns_servers[1]),
+                                ('end')]))
+
+    sendp(ack_packet, iface=network_interface)
+
+    allocated_ips.append(ack_ip)
+    available_ips = calculate_available_ips(network)
+    save_to_csv(allocated_ips)
+    
+    mac_address = format_mac_address(packet[BOOTP].chaddr)
+    print(f"ACK sent for IP address {ack_ip} to {mac_address}")
 
 def handle_ack(packet):
     print(f"DHCP ACK")
@@ -203,3 +277,14 @@ if __name__ == "__main__":
     initiate()
 
     sniff_dhcp_packets(network_interface)
+
+
+
+""" 
+Improvements:
+    - arp_scan & icmp_scan can be more efficient. Retries & timeout can be optimized. icmp multithreading can be optimized.
+    - save_to_csv should be improved. Needs to include mac addresses, lease time, renewal time, and timestamps. Also need to update values periodically even if the DHCP server was not invoked.
+    - allocated_ips & available_ips can potentially be changed from lists to dictionaries or another appropriate data structures. Appropriate changes must be made throughout all the code.
+    - Is there a way to find DNS servers dynamically instead of manual configuration?
+    - For some reason it takes the client several discover messages before an offer is accepted from this server.
+"""
