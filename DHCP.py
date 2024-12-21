@@ -1,3 +1,7 @@
+
+# Note: for this DHCP server to work on your device, you must configure the "Manually Configured GLOBAL VARIABLES" properly.
+
+
 from scapy.all import ARP, Ether, srp, sr1, ICMP, IP, conf, sniff, DHCP, BOOTP, sendp, UDP
 import psutil
 import socket
@@ -60,6 +64,12 @@ def get_default_gateway():
 # GLOBAL VARIABLES
 network, ip_address, netmask, network_interface = get_network_info()
 default_gateway = get_default_gateway()
+# Manually Configured GLOBAL VARIABLES
+lease_time = 86400  # 1 day
+renewal_time = 72000  # 20
+rebinding_time = 79200  # 22
+dns_servers = ["192.168.1.1", "62.240.110.197"]
+domain_name = "home"
 
 def arp_scan(ip_range, iface):
     arp = ARP(pdst=ip_range)
@@ -140,9 +150,12 @@ def initiate():
 
     save_to_csv(allocated_ips)
 
+    print("\nServer is now running.")
+
 def handle_discover(packet):
     global allocated_ips, available_ips, network_interface
-    
+    global lease_time, renewal_time, rebinding_time, dns_servers, domain_name
+
     requested_ip = None
     for option in packet[DHCP].options:
         if option[0] == 'requested_addr':
@@ -153,20 +166,31 @@ def handle_discover(packet):
         offer_ip = requested_ip
     else:
         if available_ips:
-            offer_ip = available_ips.pop(0)
+            offer_ip = available_ips[0]
         else:
             print("No available IP addresses to offer")
             return
 
     server_ip = get_local_ip()
+    router_ip = default_gateway
     client_mac = packet[BOOTP].chaddr
     transaction_id = packet[BOOTP].xid
 
     offer_packet = (Ether(dst=packet[Ether].src) /
-                    IP(src=server_ip, dst="255.255.255.255") /
-                    UDP(sport=67, dport=68) /
-                    BOOTP(op=2, yiaddr=offer_ip, siaddr=server_ip, chaddr=client_mac[:6], xid=transaction_id) /
-                    DHCP(options=[('message-type', 'offer'), ('server_id', server_ip), ('lease_time', 600), ('subnet_mask', '255.255.255.0'), ('end')]))
+                IP(src=server_ip, dst="255.255.255.255") /
+                UDP(sport=67, dport=68) /
+                BOOTP(op=2, yiaddr=offer_ip, siaddr=server_ip, chaddr=client_mac[:6], xid=transaction_id) /
+                DHCP(options=[('message-type', 'offer'),
+                            ('server_id', server_ip),
+                            ('lease_time', lease_time),
+                            ('subnet_mask', '255.255.255.0'),
+                            ('router', router_ip),
+                            ('name_server', dns_servers[0]),
+                            ('name_server', dns_servers[1]),
+                            ('domain', domain_name),
+                            ('renewal_time', renewal_time),
+                            ('rebinding_time', rebinding_time),
+                            ('end')]))
     
     sendp(offer_packet, iface=network_interface)
     
@@ -177,20 +201,26 @@ def format_mac_address(mac_bytes):
     return ':'.join(f'{b:02x}' for b in mac_bytes[:6])
 
 
-def handle_offer(packet):
-    print(f"DHCP Offer")
 
 def handle_request(packet):
     global allocated_ips, available_ips, network_interface, default_gateway
+    global lease_time, renewal_time, rebinding_time, dns_servers, domain_name
 
     requested_ip = None
+    server_id = None
     for option in packet[DHCP].options:
         if option[0] == 'requested_addr':
             requested_ip = option[1]
-            break
+        elif option[0] == 'server_id':
+            server_id = option[1]
 
     if requested_ip is None:
         print("No requested IP found in DHCP options")
+        return
+
+    local_server_ip = get_local_ip()
+
+    if server_id != local_server_ip:
         return
 
     client_mac = packet[BOOTP].chaddr
@@ -202,39 +232,43 @@ def handle_request(packet):
         print("Requested IP not found or already allocated")
         return
 
-    server_ip = get_local_ip()
-
-    try:
-        router_ip = default_gateway
-        dns_servers = ["62.240.110.198", "62.240.110.197"]  # Manual Configuration
-    except RuntimeError as e:
-        print(str(e))
-        return
+    server_ip = local_server_ip
+    router_ip = default_gateway
 
     ack_packet = (Ether(dst=packet[Ether].src) /
-                  IP(src=server_ip, dst="255.255.255.255") /
-                  UDP(sport=67, dport=68) /
-                  BOOTP(op=2, yiaddr=ack_ip, siaddr=server_ip, chaddr=client_mac[:6], xid=transaction_id) /
-                  DHCP(options=[('message-type', 'ack'),
-                                ('server_id', server_ip),
-                                ('lease_time', 600),
-                                ('subnet_mask', '255.255.255.0'),
-                                ('router', router_ip),
-                                ('name_server', dns_servers[0]),
-                                ('name_server', dns_servers[1]),
-                                ('end')]))
+                IP(src=server_ip, dst="255.255.255.255") /
+                UDP(sport=67, dport=68) /
+                BOOTP(op=2, yiaddr=ack_ip, siaddr=server_ip, chaddr=client_mac[:6], xid=transaction_id) /
+                DHCP(options=[('message-type', 'ack'),
+                            ('server_id', server_ip),
+                            ('lease_time', lease_time),
+                            ('subnet_mask', '255.255.255.0'),
+                            ('router', router_ip),
+                            ('name_server', dns_servers[0]),
+                            ('name_server', dns_servers[1]),
+                            ('domain', domain_name),
+                            ('renewal_time', renewal_time),
+                            ('rebinding_time', rebinding_time),
+                            ('end')]))
 
     sendp(ack_packet, iface=network_interface)
-
-    allocated_ips.append(ack_ip)
-    available_ips = calculate_available_ips(network)
-    save_to_csv(allocated_ips)
     
     mac_address = format_mac_address(packet[BOOTP].chaddr)
-    print(f"ACK sent for IP address {ack_ip} to {mac_address}")
 
 def handle_ack(packet):
-    print(f"DHCP ACK")
+    global allocated_ips, available_ips, network_interface
+
+    ack_ip = packet[BOOTP].yiaddr
+    server_ip = packet[IP].src
+    client_mac = format_mac_address(packet[BOOTP].chaddr)
+
+    if ack_ip not in allocated_ips:
+        allocated_ips.append(ack_ip)
+        available_ips = calculate_available_ips(network)
+        save_to_csv(allocated_ips)
+    
+    print(f"ACK detected from server {server_ip} for IP address {ack_ip} to {client_mac}")
+
 
 def handle_decline(packet):
     print(f"DHCP Decline")
@@ -253,8 +287,6 @@ def dhcp_handler(packet):
         dhcp_message_type = packet[DHCP].options[0][1]
         if dhcp_message_type == 1:
             handle_discover(packet)
-        elif dhcp_message_type == 2:
-            handle_offer(packet)
         elif dhcp_message_type == 3:
             handle_request(packet)
         elif dhcp_message_type == 5:
@@ -280,11 +312,19 @@ if __name__ == "__main__":
 
 
 
-""" 
-Improvements:
+"""
+Phase 3:
+- Add handling functionalities for DHCP Decline, NAK, Release, & Inform messages.
+- save_to_csv should be improved. Needs to include mac addresses, lease time, renewal time, and timestamps.
+  Also need to update values periodically even if the DHCP server was not invoked.
+- Add functionality  
+
+"""
+
+"""
+Performance Improvements:
     - arp_scan & icmp_scan can be more efficient. Retries & timeout can be optimized. icmp multithreading can be optimized.
-    - save_to_csv should be improved. Needs to include mac addresses, lease time, renewal time, and timestamps. Also need to update values periodically even if the DHCP server was not invoked.
-    - allocated_ips & available_ips can potentially be changed from lists to dictionaries or another appropriate data structures. Appropriate changes must be made throughout all the code.
+    - allocated_ips & available_ips can potentially be changed from lists to dictionaries or another appropriate data structure. Appropriate changes must be made throughout all the code.
     - Is there a way to find DNS servers dynamically instead of manual configuration?
     - For some reason it takes the client several discover messages before an offer is accepted from this server.
 """
