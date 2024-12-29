@@ -79,7 +79,7 @@ def arp_scan(ip_range, iface):
     ether = Ether(dst="ff:ff:ff:ff:ff:ff")
     packet = ether/arp
 
-    result = srp(packet, timeout=3, verbose=1, iface=iface, retry=2)[0]
+    result = srp(packet, timeout=2, verbose=1, iface=iface, retry=2)[0]
 
     devices = []
     for sent, received in result:
@@ -278,9 +278,9 @@ def handle_request(packet):
             allocated_ips[requested_ip]['lease_time'] = lease_time
             allocated_ips[requested_ip]['timestamp'] = time.time()
         else:
-            print(f"IP address {requested_ip} is already allocated to a different MAC address")
+            handle_nak(packet)
             return
-    elif requested_ip not in allocated_ips:
+    elif requested_ip in available_ips:
         # Allocate new IP if not already allocated
         allocated_ips[requested_ip] = {
             'mac': client_mac,
@@ -288,8 +288,10 @@ def handle_request(packet):
             'renewal_time': renewal_time,
             'timestamp': time.time()
         }
+        available_ips.remove(requested_ip)
     else:
-        print("Requested IP not found or already allocated")
+        # Send NAK for invalid IP address requests
+        handle_nak(packet)
         return
 
     save_to_csv(allocated_ips)
@@ -316,6 +318,7 @@ def handle_request(packet):
     sendp(ack_packet, iface=network_interface)
     
     print(f"ACK sent for IP address {requested_ip} to {client_mac}")
+
 
 def handle_ack(packet):
     global allocated_ips, available_ips, network_interface
@@ -361,13 +364,70 @@ def handle_decline(packet):
 
 
 def handle_nak(packet):
-    print(f"DHCP NAK")
+    global network_interface
+
+    client_mac = packet[BOOTP].chaddr
+    transaction_id = packet[BOOTP].xid
+    server_ip = get_local_ip()
+
+    nak_packet = (Ether(dst=packet[Ether].src) /
+                  IP(src=server_ip, dst="255.255.255.255") /
+                  UDP(sport=67, dport=68) /
+                  BOOTP(op=2, yiaddr="0.0.0.0", siaddr=server_ip, chaddr=client_mac[:6], xid=transaction_id) /
+                  DHCP(options=[('message-type', 'nak'),
+                                ('server_id', server_ip),
+                                ('end')]))
+
+    sendp(nak_packet, iface=network_interface)
+    print(f"DHCP NAK sent to {format_mac_address(client_mac)}")
+
 
 def handle_release(packet):
-    print(f"DHCP Release")
+    global allocated_ips, available_ips, network
+
+    released_ip = packet[BOOTP].yiaddr
+    client_mac = format_mac_address(packet[BOOTP].chaddr)
+
+    if released_ip in allocated_ips:
+
+        if allocated_ips[released_ip]['mac'] == client_mac: # Verify if the IP is actually allocated to the client releasing it
+            del allocated_ips[released_ip]
+            available_ips = calculate_available_ips(network)
+            save_to_csv(allocated_ips)
+            print(f"DHCP Release: IP address {released_ip} released by {client_mac} and is now available")
+
+        else:
+            print(f"DHCP Release: IP address {released_ip} is not allocated to {client_mac}")
+    else:
+        print(f"DHCP Release: IP address {released_ip} not found in allocated IPs list")
 
 def handle_inform(packet):
-    print(f"DHCP Inform")
+    global network_interface, lease_time, renewal_time, rebinding_time, dns_servers, domain_name, default_gateway
+
+    client_mac = packet[BOOTP].chaddr
+    transaction_id = packet[BOOTP].xid
+    client_ip = packet[IP].src
+    server_ip = get_local_ip()
+
+    ack_packet = (Ether(dst=packet[Ether].src) /
+                  IP(src=server_ip, dst=client_ip) /
+                  UDP(sport=67, dport=68) /
+                  BOOTP(op=2, yiaddr=client_ip, siaddr=server_ip, chaddr=client_mac[:6], xid=transaction_id) /
+                  DHCP(options=[('message-type', 'ack'),
+                                ('server_id', server_ip),
+                                ('lease_time', lease_time),
+                                ('subnet_mask', '255.255.255.0'),
+                                ('router', default_gateway),
+                                ('name_server', dns_servers[0]),
+                                ('name_server', dns_servers[1]),
+                                ('domain', domain_name),
+                                ('renewal_time', renewal_time),
+                                ('rebinding_time', rebinding_time),
+                                ('end')]))
+
+    sendp(ack_packet, iface=network_interface)
+    print(f"DHCP INFORM handled: Configuration sent to {format_mac_address(client_mac)}")
+
 
 def dhcp_handler(packet):
     if DHCP in packet:
@@ -380,8 +440,6 @@ def dhcp_handler(packet):
             handle_ack(packet)
         elif dhcp_message_type == 4:
             handle_decline(packet)
-        elif dhcp_message_type == 6:
-            handle_nak(packet)
         elif dhcp_message_type == 7:
             handle_release(packet)
         elif dhcp_message_type == 8:
@@ -401,17 +459,8 @@ if __name__ == "__main__":
 
 
 """
-Phase 3:
-- Add handling functionalities for DHCP Decline, NAK, Release, & Inform messages.
-- save_to_csv should be improved. Needs to include mac addresses, lease time, renewal time, and timestamps.
-  Also need to update values periodically even if the DHCP server was not invoked.
-
-"""
-
-"""
 Performance Improvements:
     - arp_scan & icmp_scan can be more efficient. Retries & timeout can be optimized. icmp multithreading can be optimized.
-    - allocated_ips & available_ips can potentially be changed from lists to dictionaries or another appropriate data structure. Appropriate changes must be made throughout all the code.
     - Is there a way to find DNS servers dynamically instead of manual configuration?
     - For some reason it takes the client several discover messages before an offer is accepted from this server.
 """
