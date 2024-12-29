@@ -9,8 +9,11 @@ import ipaddress
 import concurrent.futures
 import csv
 import os
+import time
+import threading
 
-allocated_ips = []
+allocated_ips = {}
+
 available_ips = []
 
 def get_network_info():
@@ -66,8 +69,8 @@ network, ip_address, netmask, network_interface = get_network_info()
 default_gateway = get_default_gateway()
 # Manually Configured GLOBAL VARIABLES
 lease_time = 86400  # 1 day
-renewal_time = 72000  # 20
-rebinding_time = 79200  # 22
+renewal_time = 72000  # 20 hrs
+rebinding_time = 79200  # 22 hrs
 dns_servers = ["192.168.1.1", "62.240.110.197"]
 domain_name = "home"
 
@@ -104,17 +107,18 @@ def icmp_scan(ip_range, retries=1, timeout=1):
 
 def save_to_csv(allocated_ips, filename='DHCP.csv'):
     with open(filename, 'w', newline='') as csvfile:
-        fieldnames = ['IP Address']
+        fieldnames = ['IP Address', 'MAC Address', 'Lease Time', 'Renewal Time', 'Timestamp']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
         writer.writeheader()
-        for ip in allocated_ips:
-            writer.writerow({'IP Address': ip})
+        for ip, details in allocated_ips.items():
+            writer.writerow({'IP Address': ip, 'MAC Address': details['mac'], 'Lease Time': details['lease_time'], 'Renewal Time': details['renewal_time'], 'Timestamp': details['timestamp']})
+
 
 def calculate_available_ips(network):
     global allocated_ips
 
-    allocated_ip_addresses = set(allocated_ips)
+    allocated_ip_addresses = set(allocated_ips.keys())
     
     all_ips = set(str(ip) for ip in network.hosts())
     
@@ -130,9 +134,30 @@ def get_local_ip():
     local_ip = socket.gethostbyname(hostname)
     return local_ip
 
+def handle_expired_leases():
+    global allocated_ips, available_ips, network
+
+    current_time = time.time()
+    expired_ips = []
+
+    for ip, details in list(allocated_ips.items()):
+        lease_end_time = details['timestamp'] + details['lease_time']
+        if current_time > lease_end_time:
+            expired_ips.append(ip)
+            print(f"Lease for IP address {ip} has expired and is now available")
+
+    for ip in expired_ips:
+        del allocated_ips[ip]
+        available_ips = calculate_available_ips(network)
+        save_to_csv(allocated_ips)
+
+def periodic_check():
+
+    handle_expired_leases()
+    threading.Timer(600, periodic_check).start() # check expired leases every 10 minutes
+
 
 def initiate():
-
     global allocated_ips, available_ips, network, ip_address, netmask, network_interface
 
     ip_range = f"{network.network_address}/{network.prefixlen}"
@@ -142,9 +167,30 @@ def initiate():
     arp_devices = arp_scan(ip_range, network_interface)
     icmp_devices = icmp_scan(ip_range)
 
+    default_lease_time = 86400  # 1 day
+    default_renewal_time = 72000  # 20 hours
+    default_timestamp = time.time()
 
-    allocated_ips.extend(device['ip'] for device in arp_devices)
-    allocated_ips.extend(device['ip'] for device in icmp_devices if device['ip'] not in allocated_ips)
+    for device in arp_devices:
+        ip = device['ip']
+        mac = device['mac']
+        if ip not in allocated_ips:
+            allocated_ips[ip] = {
+                'mac': mac,
+                'lease_time': default_lease_time,
+                'renewal_time': default_renewal_time,
+                'timestamp': default_timestamp
+            }
+    
+    for device in icmp_devices:
+        ip = device['ip']
+        if ip not in allocated_ips:
+            allocated_ips[ip] = {
+                'mac': "Unknown",
+                'lease_time': default_lease_time,
+                'renewal_time': default_renewal_time,
+                'timestamp': default_timestamp
+            }
 
     available_ips = calculate_available_ips(network)
 
@@ -201,7 +247,6 @@ def format_mac_address(mac_bytes):
     return ':'.join(f'{b:02x}' for b in mac_bytes[:6])
 
 
-
 def handle_request(packet):
     global allocated_ips, available_ips, network_interface, default_gateway
     global lease_time, renewal_time, rebinding_time, dns_servers, domain_name
@@ -223,14 +268,31 @@ def handle_request(packet):
     if server_id != local_server_ip:
         return
 
-    client_mac = packet[BOOTP].chaddr
+    client_mac = format_mac_address(packet[BOOTP].chaddr)
     transaction_id = packet[BOOTP].xid
 
-    if requested_ip and (requested_ip not in allocated_ips):
-        ack_ip = requested_ip
+    if requested_ip in allocated_ips:
+        # Check if the requesting client is the same as the one already allocated the IP
+        if allocated_ips[requested_ip]['mac'] == client_mac:
+            # Renew the lease for the existing entry
+            allocated_ips[requested_ip]['lease_time'] = lease_time
+            allocated_ips[requested_ip]['timestamp'] = time.time()
+        else:
+            print(f"IP address {requested_ip} is already allocated to a different MAC address")
+            return
+    elif requested_ip not in allocated_ips:
+        # Allocate new IP if not already allocated
+        allocated_ips[requested_ip] = {
+            'mac': client_mac,
+            'lease_time': lease_time,
+            'renewal_time': renewal_time,
+            'timestamp': time.time()
+        }
     else:
         print("Requested IP not found or already allocated")
         return
+
+    save_to_csv(allocated_ips)
 
     server_ip = local_server_ip
     router_ip = default_gateway
@@ -238,7 +300,7 @@ def handle_request(packet):
     ack_packet = (Ether(dst=packet[Ether].src) /
                 IP(src=server_ip, dst="255.255.255.255") /
                 UDP(sport=67, dport=68) /
-                BOOTP(op=2, yiaddr=ack_ip, siaddr=server_ip, chaddr=client_mac[:6], xid=transaction_id) /
+                BOOTP(op=2, yiaddr=requested_ip, siaddr=server_ip, chaddr=packet[BOOTP].chaddr[:6], xid=transaction_id) /
                 DHCP(options=[('message-type', 'ack'),
                             ('server_id', server_ip),
                             ('lease_time', lease_time),
@@ -253,7 +315,7 @@ def handle_request(packet):
 
     sendp(ack_packet, iface=network_interface)
     
-    mac_address = format_mac_address(packet[BOOTP].chaddr)
+    print(f"ACK sent for IP address {requested_ip} to {client_mac}")
 
 def handle_ack(packet):
     global allocated_ips, available_ips, network_interface
@@ -263,15 +325,40 @@ def handle_ack(packet):
     client_mac = format_mac_address(packet[BOOTP].chaddr)
 
     if ack_ip not in allocated_ips:
-        allocated_ips.append(ack_ip)
-        available_ips = calculate_available_ips(network)
-        save_to_csv(allocated_ips)
+            allocated_ips[ack_ip] = {
+                'mac': client_mac,
+                'lease_time': lease_time,
+                'renewal_time': renewal_time,
+                'timestamp': time.time()
+            }
+            available_ips = calculate_available_ips(network)
+            save_to_csv(allocated_ips)
     
     print(f"ACK detected from server {server_ip} for IP address {ack_ip} to {client_mac}")
 
 
 def handle_decline(packet):
-    print(f"DHCP Decline")
+    global allocated_ips, available_ips
+
+    declined_ip = None
+    for option in packet[DHCP].options:
+        if option[0] == 'requested_addr':
+            declined_ip = option[1]
+            break
+
+        if declined_ip and (declined_ip not in allocated_ips):
+            allocated_ips[declined_ip] = {
+                'mac': None,
+                'lease_time': lease_time,
+                'renewal_time': renewal_time,
+                'timestamp': time.time()
+            }
+
+        save_to_csv(allocated_ips)
+        print(f"Declined IP address {declined_ip} added to allocated IPs list")
+
+    available_ips = calculate_available_ips(network)
+
 
 def handle_nak(packet):
     print(f"DHCP NAK")
@@ -308,8 +395,9 @@ if __name__ == "__main__":
 
     initiate()
 
-    sniff_dhcp_packets(network_interface)
+    periodic_check()
 
+    sniff_dhcp_packets(network_interface)
 
 
 """
@@ -317,7 +405,6 @@ Phase 3:
 - Add handling functionalities for DHCP Decline, NAK, Release, & Inform messages.
 - save_to_csv should be improved. Needs to include mac addresses, lease time, renewal time, and timestamps.
   Also need to update values periodically even if the DHCP server was not invoked.
-- Add functionality  
 
 """
 
