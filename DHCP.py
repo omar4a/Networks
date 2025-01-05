@@ -251,7 +251,6 @@ def handle_discover(packet):
         if available_ips:
             offer_ip = available_ips[0]
         else:
-            print("No available IP addresses to offer")
             return
 
     server_ip = get_local_ip()
@@ -279,9 +278,6 @@ def handle_discover(packet):
     
     mac_address = format_mac_address(packet[BOOTP].chaddr)
     print(f"Offered IP address {offer_ip} to {mac_address}")
-
-def format_mac_address(mac_bytes):
-    return ':'.join(f'{b:02x}' for b in mac_bytes[:6])
 
 
 def handle_request(packet):
@@ -375,8 +371,6 @@ def handle_ack(packet):
             }
             available_ips = calculate_available_ips(network)
             save_to_csv(allocated_ips)
-    
-    print(f"ACK detected from server {server_ip} for IP address {ack_ip} to {client_mac}")
 
 
 def handle_decline(packet):
@@ -438,7 +432,7 @@ def handle_release(packet):
         else:
             print(f"DHCP Release: IP address {released_ip} is not allocated to {client_mac}")
     else:
-        print(f"DHCP Release: IP address {released_ip} not found in allocated IPs list")
+        print(f"DHCP Release detected from {client_mac}")
 
 def handle_inform(packet):
     global network_interface, lease_time, renewal_time, rebinding_time, dns_servers, domain_name, default_gateway
@@ -474,7 +468,6 @@ def dhcp_handler(packet):
         if dhcp_message_type == 1:
             handle_discover(packet)
         elif dhcp_message_type == 3:
-            print("Request detected")
             handle_request(packet)
         elif dhcp_message_type == 5:
             handle_ack(packet)
