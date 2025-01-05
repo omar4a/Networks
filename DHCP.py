@@ -79,7 +79,7 @@ def arp_scan(ip_range, iface):
     ether = Ether(dst="ff:ff:ff:ff:ff:ff")
     packet = ether/arp
 
-    result = srp(packet, timeout=2, verbose=1, iface=iface, retry=2)[0]
+    result = srp(packet, timeout=1, verbose=1, iface=iface, retry=0)[0]
 
     devices = []
     for sent, received in result:
@@ -87,7 +87,7 @@ def arp_scan(ip_range, iface):
     
     return devices
 
-def icmp_scan(ip_range, retries=1, timeout=1):
+def icmp_scan(ip_range, retries=0, timeout=1):
     def ping(ip):
         for _ in range(retries):
             pkt = IP(dst=ip)/ICMP()
@@ -97,7 +97,7 @@ def icmp_scan(ip_range, retries=1, timeout=1):
         return None
 
     devices = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
         future_to_ip = {executor.submit(ping, str(ip)): ip for ip in ipaddress.IPv4Network(ip_range).hosts()}
         for future in concurrent.futures.as_completed(future_to_ip):
             result = future.result()
@@ -154,7 +154,44 @@ def handle_expired_leases():
 def periodic_check():
 
     handle_expired_leases()
-    threading.Timer(600, periodic_check).start() # check expired leases every 10 minutes
+
+    global allocated_ips, available_ips, network, ip_address, netmask, network_interface
+
+    ip_range = f"{network.network_address}/{network.prefixlen}"
+
+    arp_devices = arp_scan(ip_range, network_interface)
+    icmp_devices = icmp_scan(ip_range)
+
+    default_lease_time = 86400  # 1 day
+    default_renewal_time = 72000  # 20 hours
+    default_timestamp = time.time()
+
+    for device in arp_devices:
+        ip = device['ip']
+        mac = device['mac']
+        if ip not in allocated_ips:
+            allocated_ips[ip] = {
+                'mac': mac,
+                'lease_time': default_lease_time,
+                'renewal_time': default_renewal_time,
+                'timestamp': default_timestamp
+            }
+    
+    for device in icmp_devices:
+        ip = device['ip']
+        if ip not in allocated_ips:
+            allocated_ips[ip] = {
+                'mac': "Unknown",
+                'lease_time': default_lease_time,
+                'renewal_time': default_renewal_time,
+                'timestamp': default_timestamp
+            }
+
+    available_ips = calculate_available_ips(network)
+
+    save_to_csv(allocated_ips)
+
+    threading.Timer(600, periodic_check).start() # check every 10 minutes
 
 
 def initiate():
@@ -260,12 +297,14 @@ def handle_request(packet):
             server_id = option[1]
 
     if requested_ip is None:
-        print("No requested IP found in DHCP options")
+        requested_ip = packet[BOOTP].ciaddr
+    
+    if requested_ip is None or requested_ip == "0.0.0.0":
         return
 
     local_server_ip = get_local_ip()
 
-    if server_id != local_server_ip:
+    if server_id != local_server_ip and server_id is not None:
         return
 
     client_mac = format_mac_address(packet[BOOTP].chaddr)
@@ -349,16 +388,16 @@ def handle_decline(packet):
             declined_ip = option[1]
             break
 
-        if declined_ip and (declined_ip not in allocated_ips):
-            allocated_ips[declined_ip] = {
-                'mac': None,
-                'lease_time': lease_time,
-                'renewal_time': renewal_time,
-                'timestamp': time.time()
-            }
+    if declined_ip and (declined_ip not in allocated_ips):
+        allocated_ips[declined_ip] = {
+            'mac': None,
+            'lease_time': lease_time,
+            'renewal_time': renewal_time,
+            'timestamp': time.time()
+        }
 
-        save_to_csv(allocated_ips)
-        print(f"Declined IP address {declined_ip} added to allocated IPs list")
+    save_to_csv(allocated_ips)
+    print(f"Declined IP address {declined_ip} added to allocated IPs list")
 
     available_ips = calculate_available_ips(network)
 
@@ -435,6 +474,7 @@ def dhcp_handler(packet):
         if dhcp_message_type == 1:
             handle_discover(packet)
         elif dhcp_message_type == 3:
+            print("Request detected")
             handle_request(packet)
         elif dhcp_message_type == 5:
             handle_ack(packet)
@@ -451,16 +491,8 @@ def sniff_dhcp_packets(interface):
 
 if __name__ == "__main__":
 
-    initiate()
-
     periodic_check()
 
+    initiate()
+
     sniff_dhcp_packets(network_interface)
-
-
-"""
-Performance Improvements:
-    - arp_scan & icmp_scan can be more efficient. Retries & timeout can be optimized. icmp multithreading can be optimized.
-    - Is there a way to find DNS servers dynamically instead of manual configuration?
-    - For some reason it takes the client several discover messages before an offer is accepted from this server.
-"""
