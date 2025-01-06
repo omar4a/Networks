@@ -7,6 +7,7 @@ import psutil
 import socket
 import ipaddress
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 import csv
 import os
 import time
@@ -63,6 +64,17 @@ def get_default_gateway():
                             except KeyError:
                                 continue
     raise RuntimeError("Default gateway not found")
+
+def get_user_input():
+    lease_time = int(input("\nPlease enter lease time in seconds: "))
+    renewal_time = int(input("\nPlease enter renewal time in seconds: "))
+    rebinding_time = int(input("\nPlease enter rebinding time in seconds: "))
+    dns_servers = input("\nPlease enter 2 DNS servers (comma-separated): ").split(',')
+    domain_name = input("\nPlease enter the domain name: ")
+    print()
+
+    return lease_time, renewal_time, rebinding_time, dns_servers, domain_name
+
 
 # GLOBAL VARIABLES
 network, ip_address, netmask, network_interface = get_network_info()
@@ -144,7 +156,7 @@ def handle_expired_leases():
         lease_end_time = details['timestamp'] + details['lease_time']
         if current_time > lease_end_time:
             expired_ips.append(ip)
-            print(f"Lease for IP address {ip} has expired and is now available")
+            print(f"Lease for IP address {ip} has expired and is now available\n")
 
     for ip in expired_ips:
         del allocated_ips[ip]
@@ -195,11 +207,15 @@ def periodic_check():
 
 
 def initiate():
+
+    global lease_time, renewal_time, rebinding_time, dns_servers, domain_name
     global allocated_ips, available_ips, network, ip_address, netmask, network_interface
+
+    lease_time, renewal_time, rebinding_time, dns_servers, domain_name = get_user_input()
 
     ip_range = f"{network.network_address}/{network.prefixlen}"
 
-    print(f"Scanning network: {ip_range} on interface {network_interface}")
+    print(f"Scanning network: {ip_range} on interface {network_interface}\n")
 
     arp_devices = arp_scan(ip_range, network_interface)
     icmp_devices = icmp_scan(ip_range)
@@ -233,7 +249,7 @@ def initiate():
 
     save_to_csv(allocated_ips)
 
-    print("\nServer is now running.")
+    print("\nServer is now running.\n")
 
 def handle_discover(packet):
     global allocated_ips, available_ips, network_interface
@@ -277,7 +293,7 @@ def handle_discover(packet):
     sendp(offer_packet, iface=network_interface)
     
     mac_address = format_mac_address(packet[BOOTP].chaddr)
-    print(f"Offered IP address {offer_ip} to {mac_address}")
+    print(f"Offered IP address {offer_ip} to {mac_address}\n")
 
 
 def handle_request(packet):
@@ -352,7 +368,7 @@ def handle_request(packet):
 
     sendp(ack_packet, iface=network_interface)
     
-    print(f"ACK sent for IP address {requested_ip} to {client_mac}")
+    print(f"ACK sent for IP address {requested_ip} to {client_mac}\n")
 
 
 def handle_ack(packet):
@@ -391,7 +407,7 @@ def handle_decline(packet):
         }
 
     save_to_csv(allocated_ips)
-    print(f"Declined IP address {declined_ip} added to allocated IPs list")
+    print(f"Declined IP address {declined_ip} added to allocated IPs list\n")
 
     available_ips = calculate_available_ips(network)
 
@@ -412,7 +428,7 @@ def handle_nak(packet):
                                 ('end')]))
 
     sendp(nak_packet, iface=network_interface)
-    print(f"DHCP NAK sent to {format_mac_address(client_mac)}")
+    print(f"DHCP NAK sent to {format_mac_address(client_mac)}\n")
 
 
 def handle_release(packet):
@@ -427,12 +443,12 @@ def handle_release(packet):
             del allocated_ips[released_ip]
             available_ips = calculate_available_ips(network)
             save_to_csv(allocated_ips)
-            print(f"DHCP Release: IP address {released_ip} released by {client_mac} and is now available")
+            print(f"DHCP Release: IP address {released_ip} released by {client_mac} and is now available\n")
 
         else:
-            print(f"DHCP Release: IP address {released_ip} is not allocated to {client_mac}")
+            print(f"DHCP Release: IP address {released_ip} is not allocated to {client_mac}\n")
     else:
-        print(f"DHCP Release detected from {client_mac}")
+        print(f"DHCP Release detected from {client_mac}\n")
 
 def handle_inform(packet):
     global network_interface, lease_time, renewal_time, rebinding_time, dns_servers, domain_name, default_gateway
@@ -459,7 +475,7 @@ def handle_inform(packet):
                                 ('end')]))
 
     sendp(ack_packet, iface=network_interface)
-    print(f"DHCP INFORM handled: Configuration sent to {format_mac_address(client_mac)}")
+    print(f"DHCP INFORM handled: Configuration sent to {format_mac_address(client_mac)}\n")
 
 
 def dhcp_handler(packet):
@@ -478,8 +494,15 @@ def dhcp_handler(packet):
         elif dhcp_message_type == 8:
             handle_inform(packet)
 
+def thread_wrapper(packet):
+    dhcp_handler(packet)            
+
 def sniff_dhcp_packets(interface):
-    sniff(filter="port 67 or port 68", prn=dhcp_handler, iface=interface, store=0)
+     conf.verb = 0 # Turn off verbosity 
+     with ThreadPoolExecutor(max_workers=20) as executor: 
+        def submit_packet(packet):
+            executor.submit(thread_wrapper, packet) 
+        sniff(filter="port 67 or port 68", prn=submit_packet, iface=interface, store=0)
 
 
 if __name__ == "__main__":
