@@ -1,5 +1,9 @@
 To run the DHCP server, please do the following:
 
+- Make sure your device is connected to the internet.
+(You can release/renew later to test the server. But as the server first starts, you must be connected to the internet so the server
+can get network info)
+
 - Make sure you are connected via an ethernet cable.
 (The server works on any interface, but it's most reliable on ethernet)
 
