@@ -1,7 +1,3 @@
-
-# Note: for this DHCP server to work on your device, you must configure the "Manually Configured GLOBAL VARIABLES" properly.
-
-
 from scapy.all import ARP, Ether, srp, sr1, ICMP, IP, conf, sniff, DHCP, BOOTP, sendp, UDP
 import psutil
 import socket
