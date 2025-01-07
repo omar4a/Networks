@@ -1,5 +1,7 @@
 To run the DHCP server, please do the following:
 
+- Make sure you have npcap installed.
+
 - Make sure your device is connected to the internet.
 (You can release/renew later to test the server. But as the server first starts, you must be connected to the internet so the server
 can get network info)

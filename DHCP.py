@@ -14,27 +14,46 @@ allocated_ips = {}
 available_ips = []
 
 def get_network_info():
+    
     interfaces = psutil.net_if_addrs()
+    active_interfaces = psutil.net_if_stats()
 
     ip_address = None
     netmask = None
     network_interface = None
 
-    for interface, addrs in interfaces.items():
-        for addr in addrs:
-            if addr.family == socket.AF_INET and not addr.address.startswith("169.254"):
-                ip_address = addr.address
-                netmask = addr.netmask
-                network_interface = interface
+    preferred_interfaces = ['Wi-Fi', 'wlan0', 'Ethernet', 'eth0', 'en0', 'en1']
+
+    for interface in preferred_interfaces:
+        if interface in interfaces:
+            for addr in interfaces[interface]:
+                if addr.family == socket.AF_INET and not addr.address.startswith("169.254"):
+                    if active_interfaces[interface].isup:
+                        ip_address = addr.address
+                        netmask = addr.netmask
+                        network_interface = interface
+                        break
+            if ip_address and netmask:
                 break
-        if ip_address and netmask:
-            break
+
+    if ip_address is None or netmask is None:
+        for interface, addrs in interfaces.items():
+            if active_interfaces[interface].isup:
+                for addr in addrs:
+                    if addr.family == socket.AF_INET and not addr.address.startswith("169.254"):
+                        ip_address = addr.address
+                        netmask = addr.netmask
+                        network_interface = interface
+                        break
+            if ip_address and netmask:
+                break
 
     if ip_address is None or netmask is None:
         raise ValueError("Unable to determine network address or netmask")
 
     network = ipaddress.IPv4Network(f"{ip_address}/{netmask}", strict=False)
     return network, ip_address, netmask, network_interface
+
 
 def get_default_gateway():
     gws = psutil.net_if_stats()
