@@ -23,3 +23,9 @@ Orange: 213.131.65.20
 - Enter the values for lease time, renewal time, rebinding time, DNS servers, and domain name as prompted.
 
 - The DHCP server is now running.
+
+If the server can't sniff or send packets, try the following:
+- Turn off your firewall, or give the server firewall exceptions.
+- Try using Ethernet instead of WiFi.
+
+Note: The server only works on Windows, Linux, and MAC OS.
